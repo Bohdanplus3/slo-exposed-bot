@@ -51,15 +51,22 @@ state = {
 }
 
 async def claude_text(system, user, max_tokens=1500):
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-            json={"model":"claude-sonnet-4-20250514","max_tokens":max_tokens,"system":system,
-                  "messages":[{"role":"user","content":user}]})
-        r.raise_for_status()
-        for block in r.json().get("content",[]):
-            if block.get("type")=="text": return block["text"].strip()
-        return ""
+    for attempt in range(3):
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
+                json={"model":"claude-sonnet-4-20250514","max_tokens":max_tokens,"system":system,
+                      "messages":[{"role":"user","content":user}]})
+            if r.status_code == 429:
+                wait = 20 * (attempt + 1)
+                log.warning(f"[API] 429 rate limit — cakam {wait}s (poskus {attempt+1}/3)")
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            for block in r.json().get("content",[]):
+                if block.get("type")=="text": return block["text"].strip()
+            return ""
+    raise Exception("API rate limit po 3 poskusih")
 
 async def claude_search(system, user, max_tokens=2000):
     async with httpx.AsyncClient(timeout=90) as client:
@@ -191,7 +198,9 @@ async def process_news(bot, news):
     try:
         log.info(f"[PIPELINE] {news['title'][:60]}")
         research = await research_topic(news)
+        await asyncio.sleep(10)  # пауза после web search
         post = await write_post(research, news)
+        await asyncio.sleep(5)   # пауза перед editor
         verdict = await editor_check(post)
         if not verdict.get("approved"):
             fix = verdict.get("fix","dodaj vec konkretnih faktov")

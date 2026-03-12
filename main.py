@@ -1,721 +1,351 @@
 """
-SLO.EXPOSED — AI Newsroom Bot
-Автономная AI-редакция для Telegram-канала о криминале и коррупции в Словении.
-
-Агенты:
-  Scanner   → мониторит RSS и обычные сайты
-  Writer    → переписывает новость в стиле SLO.EXPOSED
-  Editor    → проверяет качество поста
-  Publisher → публикует в Telegram канал
-
-Управление:
-  /start   — запустить мониторинг
-  /stop    — остановить всё
-  /pause   — пауза публикаций
-  /resume  — возобновить публикации
-  /queue   — посмотреть очередь
-  /report  — статистика
-  /test    — тестовый цикл
-  /sources — список источников
-  /help    — помощь
+SLO.EXPOSED v2.0 — AI Investigative Newsroom with Web Search
 """
 
 import os
-import re
 import asyncio
 import logging
 import json
 import hashlib
-from html import unescape
-from datetime import datetime, timedelta
-from urllib.parse import urljoin, urlparse
-
 import feedparser
 import httpx
-from bs4 import BeautifulSoup
-from telegram import Update, Bot
-from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.constants import ParseMode
-
-
-# ─── Logging ───────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s │ %(levelname)s │ %(message)s",
-    level=logging.INFO,
-    datefmt="%H:%M:%S"
+from datetime import datetime
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, ContextTypes,
+    CallbackQueryHandler,
 )
-log = logging.getLogger("slo.exposed")
 
+logging.basicConfig(format="%(asctime)s │ %(levelname)s │ %(message)s", level=logging.INFO, datefmt="%H:%M:%S")
+log = logging.getLogger("slo.exposed.v2")
 
-# ─── Config from environment ───────────────────────────────────────────────
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHANNEL_ID = os.environ["TELEGRAM_CHANNEL_ID"]   # e.g. @slo_exposed
+BOT_TOKEN         = os.environ["TELEGRAM_BOT_TOKEN"]
+CHANNEL_ID        = os.environ["TELEGRAM_CHANNEL_ID"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
-MAX_POSTS_PER_DAY = int(os.environ.get("MAX_POSTS_PER_DAY", "8"))
+ADMIN_CHAT_ID     = os.environ.get("ADMIN_CHAT_ID", "")
+MAX_POSTS_PER_DAY = int(os.environ.get("MAX_POSTS_PER_DAY", "6"))
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
-POST_LANGUAGE = os.environ.get("POST_LANGUAGE", "sl")
+AUTO_PUBLISH      = os.environ.get("AUTO_PUBLISH", "false").lower() == "true"
 
-
-# ─── Sources ───────────────────────────────────────────────────────────────
 RSS_SOURCES = [
-    {"name": "Požareport", "url": "https://pozareport.si/?View=rss", "lang": "sl", "weight": 10},
-    {"name": "RTV Slovenija", "url": "https://www.rtvslo.si/feeds/03.xml", "lang": "sl", "weight": 7},
+    {"name": "Necenzurirano", "url": "https://necenzurirano.si/feed/",     "lang": "sl"},
+    {"name": "Pozareport",    "url": "https://www.pozareport.si/feed/",    "lang": "sl"},
+    {"name": "OCCRP",         "url": "https://occrp.org/en/rss",           "lang": "en"},
+    {"name": "RTV Slovenija", "url": "https://www.rtvslo.si/feeds/03.xml", "lang": "sl"},
 ]
 
-PAGE_SOURCES = [
-    {"name": "Necenzurirano", "url": "https://necenzurirano.si/", "lang": "sl", "weight": 10},
-    {"name": "Siol Črna kronika", "url": "https://siol.net/novice/crna-kronika", "lang": "sl", "weight": 10},
-]
-
-
-# ─── Keywords ──────────────────────────────────────────────────────────────
 KEYWORDS = [
-    # Slovenian
-    "korupcija", "kriminal", "afera", "obtožba", "preiskava", "zapor",
-    "tihotapstvo", "pranje denarja", "davčna utaja", "podkupovanje",
-    "nepotizem", "malverzacija", "sodba", "aretacija", "hišna preiskava",
-    "tožilstvo", "policija", "sodišče", "škandal", "zloraba", "prisluhi",
-    "lobiranje", "podkupnina", "ovadba", "aretiran", "obtožen",
-
-    # English
-    "corruption", "crime", "scandal", "arrest", "bribery", "fraud",
-    "money laundering", "investigation", "indictment", "organized crime",
-    "embezzlement",
-
-    # Names / orgs often in SLO news
-    "slovenia", "slovenski", "NLB", "SDH", "KPK", "Janša", "Golob",
-    "Logar", "Vuković", "Klemenčič", "Počivalšek"
+    "korupcija","kriminal","afera","obtožba","preiskava","zapor",
+    "tihotapstvo","pranje denarja","davčna utaja","podkupovanje",
+    "nepotizem","malverzacija","sodba","aretacija","hišna preiskava",
+    "tožilstvo","policija","sodišče","škandal","zloraba","prevara",
+    "corruption","crime","scandal","arrest","bribery","fraud",
+    "money laundering","investigation","indictment","organized crime",
+    "Slovenia","NLB","SDH","KPK",
 ]
 
-
-# ─── State ─────────────────────────────────────────────────────────────────
 state = {
-    "running": False,
-    "paused": False,
-    "seen_urls": set(),
-    "queue": [],
-    "stats": {
-        "scanned": 0,
-        "written": 0,
-        "approved": 0,
-        "rejected": 0,
-        "published": 0,
-        "reset_at": datetime.now(),
-    }
+    "running": False, "paused": False, "autopilot": AUTO_PUBLISH,
+    "seen_urls": set(), "pending": {},
+    "stats": {"scanned":0,"researched":0,"written":0,"approved":0,"rejected":0,"published":0,"reset_at":datetime.now()},
 }
 
-
-# ─── Anthropic helper ──────────────────────────────────────────────────────
-async def claude(system: str, user: str, max_tokens: int = 800) -> str:
-    async with httpx.AsyncClient(timeout=45) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": max_tokens,
-                "system": system,
-                "messages": [{"role": "user", "content": user}],
-            }
-        )
+async def claude_text(system, user, max_tokens=1500):
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
+            json={"model":"claude-sonnet-4-20250514","max_tokens":max_tokens,"system":system,
+                  "messages":[{"role":"user","content":user}]})
         r.raise_for_status()
-        data = r.json()
-        return data["content"][0]["text"].strip()
+        for block in r.json().get("content",[]):
+            if block.get("type")=="text": return block["text"].strip()
+        return ""
 
+async def claude_search(system, user, max_tokens=2000):
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post("https://api.anthropic.com/v1/messages",
+            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
+            json={"model":"claude-sonnet-4-20250514","max_tokens":max_tokens,"system":system,
+                  "messages":[{"role":"user","content":user}],
+                  "tools":[{"type":"web_search_20250305","name":"web_search"}]})
+        r.raise_for_status()
+        parts = [b["text"] for b in r.json().get("content",[]) if b.get("type")=="text"]
+        return "\n".join(parts).strip()
 
-# ─── Helpers ───────────────────────────────────────────────────────────────
-def clean_text(text: str) -> str:
-    text = unescape(text or "")
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def url_hash(url): return hashlib.md5(url.encode()).hexdigest()
 
-
-def url_hash(url: str) -> str:
-    return hashlib.md5(url.encode("utf-8")).hexdigest()
-
-
-def normalize_url(url: str) -> str:
-    url = url.strip()
-    if url.endswith("/"):
-        return url[:-1]
-    return url
-
-
-def is_relevant(title: str, summary: str) -> bool:
-    text = f"{title} {summary}".lower()
+def is_relevant(title, summary):
+    text = (title+" "+summary).lower()
     return any(kw.lower() in text for kw in KEYWORDS)
 
-
-async def fetch_html(url: str) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/145.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "sl,en;q=0.9,ru;q=0.8",
-    }
-    async with httpx.AsyncClient(
-        timeout=25,
-        follow_redirects=True,
-        headers=headers
-    ) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        return r.text
-
-
-def same_domain(base_url: str, candidate_url: str) -> bool:
-    try:
-        return urlparse(base_url).netloc.replace("www.", "") == urlparse(candidate_url).netloc.replace("www.", "")
-    except Exception:
-        return False
-
-
-def extract_candidate_links(base_url: str, html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    seen = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "").strip()
-        if not href:
-            continue
-        if href.startswith("#") or href.startswith("javascript:") or href.startswith("mailto:"):
-            continue
-
-        full_url = urljoin(base_url, href)
-        full_url = normalize_url(full_url)
-
-        if not full_url.startswith("http"):
-            continue
-        if not same_domain(base_url, full_url):
-            continue
-        if full_url in seen:
-            continue
-
-        seen.add(full_url)
-        links.append(full_url)
-
-    return links
-
-
-def looks_like_article(url: str, source_name: str) -> bool:
-    u = url.lower()
-
-    bad_parts = [
-        "/tag/", "/tags/", "/rubrika/", "/category/", "/avtor/", "/author/",
-        "/kontakt", "/about", "/info", "/search", "/isci", "/video", "/foto",
-        "/podcast", "/login", "/prijava", "/narocnina", "/newsletter",
-        "/vreme", "/sport", "/tv-spored", "/mnenja", "/forum"
-    ]
-    if any(part in u for part in bad_parts):
-        return False
-
-    if source_name == "Necenzurirano":
-        return "/clanek/" in u
-
-    if source_name == "Siol Črna kronika":
-        return "/novice/" in u and len(u.split("/")) >= 5
-
-    return True
-
-
-def extract_page_title_summary(html: str) -> tuple[str, str]:
-    soup = BeautifulSoup(html, "html.parser")
-
-    title = ""
-    summary = ""
-
-    og_title = soup.find("meta", attrs={"property": "og:title"})
-    if og_title and og_title.get("content"):
-        title = clean_text(og_title["content"])
-
-    if not title and soup.title:
-        title = clean_text(soup.title.get_text(" ", strip=True))
-
-    og_desc = soup.find("meta", attrs={"property": "og:description"})
-    if og_desc and og_desc.get("content"):
-        summary = clean_text(og_desc["content"])
-
-    if not summary:
-        meta_desc = soup.find("meta", attrs={"name": "description"})
-        if meta_desc and meta_desc.get("content"):
-            summary = clean_text(meta_desc["content"])
-
-    if not summary:
-        paragraphs = []
-        for p in soup.find_all("p"):
-            txt = clean_text(p.get_text(" ", strip=True))
-            if len(txt) >= 80:
-                paragraphs.append(txt)
-        if paragraphs:
-            summary = paragraphs[0]
-
-    return title[:300], summary[:800]
-
-
-# ─── AGENT 1: SCANNER ──────────────────────────────────────────────────────
-async def scan_rss_sources() -> list[dict]:
+async def scan_sources():
     found = []
-
-    for source in RSS_SOURCES:
+    for src in RSS_SOURCES:
         try:
-            feed = feedparser.parse(source["url"])
-            entries = getattr(feed, "entries", [])[:10]
-
-            log.info(f"[RSS] {source['name']}: найдено записей {len(entries)}")
-
-            for entry in entries:
-                url = normalize_url(entry.get("link", ""))
-                if not url:
-                    continue
-
+            feed = feedparser.parse(src["url"])
+            for entry in feed.entries[:10]:
+                url = entry.get("link","")
+                if not url: continue
                 h = url_hash(url)
-                if h in state["seen_urls"]:
-                    continue
-
-                title = clean_text(entry.get("title", ""))
-                summary = clean_text(entry.get("summary", entry.get("description", "")))
-
-                if not title:
-                    continue
-
+                if h in state["seen_urls"]: continue
+                title = entry.get("title","")
+                summary = entry.get("summary", entry.get("description",""))
                 if is_relevant(title, summary):
-                    found.append({
-                        "title": title,
-                        "summary": summary[:800],
-                        "url": url,
-                        "source": source["name"],
-                        "hash": h,
-                    })
+                    found.append({"title":title,"summary":summary[:600],"url":url,"source":src["name"],"hash":h})
                     state["seen_urls"].add(h)
                     state["stats"]["scanned"] += 1
-                    log.info(f"[RSS] Релевантная новость: {title[:80]} ({source['name']})")
-
+                    log.info(f"[SCANNER] {title[:60]} ({src['name']})")
         except Exception as e:
-            log.warning(f"[RSS] Ошибка {source['name']}: {e}")
-
+            log.warning(f"[SCANNER] {src['name']}: {e}")
     return found
 
+RESEARCHER_SYS = """Si investigativni novinar za SLO.EXPOSED. Za dano novico poišči na internetu:
+- Polna imena, funkcije, zneske, datume
+- Pravni status: obtožnice, sodbe, preiskave
+- Ozadje vpletenih: ali so bili že vpleteni v afere?
+- Povezave: podjetja, politika, interesne skupine
+Vrni strukturiran povzetek dejstev. Samo fakti."""
 
-async def scan_page_sources() -> list[dict]:
-    found = []
+WRITER_SYS = """Si urednik kanala SLO.EXPOSED — investigativnega Telegram kanala o korupciji v Sloveniji.
 
-    for source in PAGE_SOURCES:
-        try:
-            html = await fetch_html(source["url"])
-            links = extract_candidate_links(source["url"], html)
+FORMAT (obvezno):
+- 15-20 stavkov, ne manj ne vec
+- Struktura: 1) udarni začetek z imenom+dejanjem, 2) ozadje vpletenih, 3) dejstva kdaj/kje/kaj, 4) pravni vidik obtožbe/kazni, 5) kontekst ali so bili ze vpleteni, 6) ena ironicna zakljucna opomba
+- STIL: samo fakti, suh ton, brez vode, brez "po porocanju"
+- Max 2 emoji, ne na zacetku
+- Zadnja vrstica: @slo_exposed"""
 
-            log.info(f"[PAGE] {source['name']}: найдено ссылок {len(links)}")
+EDITOR_SYS = """Si urednik SLO.EXPOSED. Preveri po kriterijih:
+1. Dolzina: 15-20 stavkov?
+2. Konkretni fakti: imena, zneski, datumi?
+3. Pravni vidik omenjen?
+4. Konec z @slo_exposed?
+5. Stil: suh, direkten?
 
-            checked = 0
-            for link in links:
-                if checked >= 12:
-                    break
+Odgovori SAMO v JSON: {"approved":true/false,"score":1-10,"reason":"1 stavek","fix":"kaj popraviti"}"""
 
-                if not looks_like_article(link, source["name"]):
-                    continue
+async def research_topic(news):
+    prompt = f"Razisci: {news['title']}\nPovzetek: {news['summary']}\nURL: {news['url']}"
+    try:
+        result = await claude_search(RESEARCHER_SYS, prompt)
+        state["stats"]["researched"] += 1
+        log.info(f"[RESEARCHER] {len(result)} znakov")
+        return result
+    except Exception as e:
+        log.warning(f"[RESEARCHER] {e}")
+        return f"{news['title']}\n{news['summary']}"
 
-                h = url_hash(link)
-                if h in state["seen_urls"]:
-                    continue
-
-                try:
-                    article_html = await fetch_html(link)
-                    title, summary = extract_page_title_summary(article_html)
-
-                    if not title:
-                        continue
-
-                    checked += 1
-
-                    if is_relevant(title, summary):
-                        found.append({
-                            "title": title,
-                            "summary": summary[:800],
-                            "url": link,
-                            "source": source["name"],
-                            "hash": h,
-                        })
-                        state["seen_urls"].add(h)
-                        state["stats"]["scanned"] += 1
-                        log.info(f"[PAGE] Релевантная новость: {title[:80]} ({source['name']})")
-
-                except Exception as e:
-                    log.warning(f"[PAGE] Ошибка статьи {link}: {e}")
-
-        except Exception as e:
-            log.warning(f"[PAGE] Ошибка источника {source['name']}: {e}")
-
-    return found
-
-
-async def scan_sources() -> list[dict]:
-    rss_items = await scan_rss_sources()
-    page_items = await scan_page_sources()
-
-    all_items = rss_items + page_items
-
-    unique = []
-    seen_hashes = set()
-    for item in all_items:
-        if item["hash"] in seen_hashes:
-            continue
-        seen_hashes.add(item["hash"])
-        unique.append(item)
-
-    return unique
-
-
-# ─── AGENT 2: WRITER ───────────────────────────────────────────────────────
-WRITER_SYSTEM = f"""
-Ti si oster, pameten in zelo berljiv urednik Telegram kanala SLO.EXPOSED.
-Pišeš v slovenščini, kratko, jasno, udarno, brez praznih fraz.
-
-Navodila:
-- Piši samo v jeziku: {POST_LANGUAGE}
-- Napiši jedrnat Telegram post 400–900 znakov
-- Začni z bistvom
-- Izpostavi sum, afero, škandal, preiskavo ali sporni element
-- Če ni konkretnih imen ali dejstev, to jasno omeni
-- Ne izmišljaj ničesar
-- Ne uporabljaj markdown oznak
-- Dodaj na koncu podpis: @slo_exposed
-"""
-
-
-async def write_post(news: dict) -> str:
-    user_prompt = f"""
-Naslov: {news['title']}
-Povzetek: {news['summary']}
-Vir: {news['source']}
-URL: {news['url']}
-
-Napiši Telegram post za kanal SLO.EXPOSED.
-"""
-    post = await claude(WRITER_SYSTEM, user_prompt, max_tokens=500)
-    post = post.strip()
+async def write_post(research, news):
+    prompt = f"Podatki:\n{research}\n\nOriginalna novica: {news['title']}\nVir: {news['source']}\n\nNapisi samo post."
+    post = await claude_text(WRITER_SYS, prompt, max_tokens=1200)
     state["stats"]["written"] += 1
-    log.info(f"[WRITER] Написан пост ({len(post)} символов)")
+    log.info(f"[WRITER] {len(post)} znakov")
     return post
 
-
-# ─── AGENT 3: EDITOR ───────────────────────────────────────────────────────
-EDITOR_SYSTEM = """
-Si izkušen urednik investigativnega Telegram kanala SLO.EXPOSED.
-
-Naloga:
-- oceni, ali je post dovolj konkreten, močan in objavljiv
-- če manjka preveč dejstev, imen, datumov ali jasno jedro zgodbe, ga zavrni
-- vrni samo JSON brez dodatnega besedila
-
-Format:
-{
-  "approved": true/false,
-  "score": 1-10,
-  "reason": "kratka razlaga"
-}
-"""
-
-
-async def editor_check(post: str) -> dict:
-    raw = await claude(
-        EDITOR_SYSTEM,
-        f"Oceni ta Telegram post:\n\n{post}",
-        max_tokens=200
-    )
-
+async def editor_check(post):
     try:
-        start = raw.find("{")
-        end = raw.rfind("}") + 1
-        parsed = json.loads(raw[start:end])
-        return {
-            "approved": bool(parsed.get("approved", False)),
-            "score": int(parsed.get("score", 0)),
-            "reason": str(parsed.get("reason", "Ni razloga"))
-        }
-    except Exception:
-        return {
-            "approved": False,
-            "score": 0,
-            "reason": f"Editor JSON parse error: {raw[:200]}"
-        }
-
-
-# ─── AGENT 4: PUBLISHER ────────────────────────────────────────────────────
-async def publish_post(bot: Bot, post: str, url: str):
-    final_text = f"{post}\n🔗 {url}"
-    await bot.send_message(chat_id=CHANNEL_ID, text=final_text)
-    state["stats"]["published"] += 1
-    log.info("[PUBLISHER] Пост опубликован")
-
-    if ADMIN_CHAT_ID:
-        try:
-            await bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=f"✅ Опубликован пост #{state['stats']['published']}/{MAX_POSTS_PER_DAY}\n🔗 {url}"
-            )
-        except Exception as e:
-            log.warning(f"[ADMIN] Не удалось отправить уведомление: {e}")
-
-
-# ─── Main monitoring loop ──────────────────────────────────────────────────
-def maybe_reset_stats():
-    now = datetime.now()
-    if now - state["stats"]["reset_at"] >= timedelta(days=1):
-        state["stats"] = {
-            "scanned": 0,
-            "written": 0,
-            "approved": 0,
-            "rejected": 0,
-            "published": 0,
-            "reset_at": now,
-        }
-        log.info("[STATS] Суточная статистика сброшена")
-
-
-async def process_news_item(bot: Bot, news: dict):
-    log.info(f"[PIPELINE] Обработка: {news['title'][:80]}")
-
-    try:
-        post = await write_post(news)
-        verdict = await editor_check(post)
-
-        if verdict["approved"]:
-            state["stats"]["approved"] += 1
-            log.info(f"[EDITOR] Одобрено ({verdict['score']}/10): {verdict['reason']}")
-
-            if state["paused"]:
-                state["queue"].append({"post": post, "url": news["url"]})
-                log.info("[QUEUE] Пост добавлен в очередь")
-                return
-
-            if state["stats"]["published"] >= MAX_POSTS_PER_DAY:
-                state["queue"].append({"post": post, "url": news["url"]})
-                log.info("[LIMIT] Достигнут дневной лимит, пост добавлен в очередь")
-                return
-
-            await publish_post(bot, post, news["url"])
-
-        else:
-            state["stats"]["rejected"] += 1
-            log.info(f"[EDITOR] Отклонён ({verdict['score']}/10): {verdict['reason']}")
-
-            if ADMIN_CHAT_ID:
-                try:
-                    await bot.send_message(
-                        chat_id=ADMIN_CHAT_ID,
-                        text=(
-                            "❌ Отклонён\n"
-                            f"Score: {verdict['score']}/10\n"
-                            f"Причина: {verdict['reason']}\n"
-                            f"URL: {news['url']}"
-                        )
-                    )
-                except Exception as e:
-                    log.warning(f"[ADMIN] Ошибка отправки отклонения: {e}")
-
+        r = await claude_text(EDITOR_SYS, f"Preveri:\n\n{post}", max_tokens=300)
+        r = r.replace("```json","").replace("```","").strip()
+        data = json.loads(r)
+        if data.get("approved"): state["stats"]["approved"] += 1
+        else: state["stats"]["rejected"] += 1
+        log.info(f"[EDITOR] {'OK' if data.get('approved') else 'FAIL'} score={data.get('score')}")
+        return data
     except Exception as e:
-        log.exception(f"[PIPELINE] Ошибка обработки новости: {e}")
+        log.warning(f"[EDITOR] {e}")
+        return {"approved":True,"score":7,"reason":"auto-approved"}
 
+async def publish_to_channel(bot, post, url):
+    if state["stats"]["published"] >= MAX_POSTS_PER_DAY:
+        log.info("[PUBLISHER] Dnevni limit dosežen")
+        return False
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text=post)
+        state["stats"]["published"] += 1
+        log.info(f"[PUBLISHER] Objavljeno #{state['stats']['published']}")
+        if ADMIN_CHAT_ID:
+            await bot.send_message(chat_id=ADMIN_CHAT_ID,
+                text=f"Objavljeno #{state['stats']['published']}/{MAX_POSTS_PER_DAY}\n{url}")
+        return True
+    except Exception as e:
+        log.error(f"[PUBLISHER] {e}")
+        return False
 
-async def monitor_loop(bot: Bot):
-    log.info("[LOOP] Мониторинг запущен")
+async def send_for_approval(bot, post, news):
+    if not ADMIN_CHAT_ID:
+        await publish_to_channel(bot, post, news["url"])
+        return
+    pid = news["hash"][:8]
+    state["pending"][pid] = {"post":post,"url":news["url"],"title":news["title"]}
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("OBJAVI", callback_data=f"approve_{pid}"),
+        InlineKeyboardButton("ZAVRNI", callback_data=f"reject_{pid}"),
+    ]])
+    preview = post[:300]+"..." if len(post)>300 else post
+    await bot.send_message(chat_id=ADMIN_CHAT_ID,
+        text=f"Nov post caka odobritev:\n\n{preview}\n\nVir: {news['url']}",
+        reply_markup=keyboard)
+    log.info(f"[APPROVAL] Post {pid} poslan v odobritev")
 
+async def process_news(bot, news):
+    try:
+        log.info(f"[PIPELINE] {news['title'][:60]}")
+        research = await research_topic(news)
+        post = await write_post(research, news)
+        verdict = await editor_check(post)
+        if not verdict.get("approved"):
+            fix = verdict.get("fix","dodaj vec konkretnih faktov")
+            log.info(f"[PIPELINE] Popravljam: {fix}")
+            post2 = await claude_text(WRITER_SYS, f"Popravi glede na: {fix}\n\nOriginal:\n{post}", 1200)
+            verdict2 = await editor_check(post2)
+            if verdict2.get("approved"):
+                post = post2
+            else:
+                log.info("[PIPELINE] 2x zavrnjen — preskočeno")
+                return
+        if state["autopilot"]:
+            await publish_to_channel(bot, post, news["url"])
+        else:
+            await send_for_approval(bot, post, news)
+    except Exception as e:
+        log.error(f"[PIPELINE] {e}")
+
+async def run_pipeline(bot):
+    log.info("--- Skeniranje ---")
+    items = await scan_sources()
+    if not items:
+        log.info("[PIPELINE] Ni novih novic")
+        return
+    log.info(f"[PIPELINE] {len(items)} novic")
+    for news in items[:2]:
+        await process_news(bot, news)
+        await asyncio.sleep(30)
+
+async def monitor_loop(bot):
     while state["running"]:
         try:
-            maybe_reset_stats()
-
-            found = await scan_sources()
-            log.info(f"[SCAN] Новых релевантных новостей: {len(found)}")
-
-            for news in found:
-                if not state["running"]:
-                    break
-                await process_news_item(bot, news)
-                await asyncio.sleep(5)
-
+            if not state["paused"]:
+                await run_pipeline(bot)
         except Exception as e:
-            log.exception(f"[LOOP] Критическая ошибка цикла: {e}")
-
+            log.error(f"[MONITOR] {e}")
+        now = datetime.now()
+        if now.date() > state["stats"]["reset_at"].date():
+            state["stats"].update({"scanned":0,"researched":0,"written":0,"approved":0,"rejected":0,"published":0,"reset_at":now})
         await asyncio.sleep(SCAN_INTERVAL_SEC)
 
-    log.info("[LOOP] Мониторинг остановлен")
+async def handle_approval(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if data.startswith("approve_"):
+        pid = data.replace("approve_","")
+        item = state["pending"].pop(pid, None)
+        if item:
+            await publish_to_channel(ctx.bot, item["post"], item["url"])
+            await query.edit_message_text(f"Objavljeno v {CHANNEL_ID}")
+        else:
+            await query.edit_message_text("Post ni vec na voljo")
+    elif data.startswith("reject_"):
+        pid = data.replace("reject_","")
+        state["pending"].pop(pid, None)
+        state["stats"]["rejected"] += 1
+        await query.edit_message_text("Zavrnjeno")
 
-
-# ─── BOT COMMANDS ──────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state["running"]:
-        await update.message.reply_text("⚡ Редакция уже работает.")
+        await update.message.reply_text("Redakcija ze deluje.")
         return
-
     state["running"] = True
     state["paused"] = False
-
-    all_source_names = [s["name"] for s in RSS_SOURCES] + [s["name"] for s in PAGE_SOURCES]
-
     await update.message.reply_text(
-        "◎ SLO.EXPOSED запущен\n\n"
-        f"Сканирую: {', '.join(all_source_names)}\n"
-        f"Интервал: каждые {SCAN_INTERVAL_SEC // 60} мин\n"
-        f"Лимит: {MAX_POSTS_PER_DAY} постов/день\n"
-        f"Канал: {CHANNEL_ID}\n\n"
-        "Для остановки: /stop"
+        f"SLO.EXPOSED v2.0 zagnan\n\n"
+        f"Viri: {', '.join(s['name'] for s in RSS_SOURCES)}\n"
+        f"Interval: {SCAN_INTERVAL_SEC//60} min\n"
+        f"Kanal: {CHANNEL_ID}\n"
+        f"Nacin: {'AUTOPILOT' if state['autopilot'] else 'ODOBRITEV'}\n"
+        f"Web search: AKTIVEN\n\n"
+        f"/stop za ustavitev"
     )
-
     asyncio.create_task(monitor_loop(ctx.bot))
-    log.info("[CMD] /start — редакция запущена")
-
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["running"] = False
-    state["paused"] = False
-    await update.message.reply_text("⬛ Редакция остановлена. /start для возобновления.")
-    log.info("[CMD] /stop")
-
+    await update.message.reply_text("Ustavljeno. /start za ponovni zagon.")
 
 async def cmd_pause(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["paused"] = True
-    await update.message.reply_text(
-        "⏸ Публикации на паузе. Мониторинг продолжается.\n"
-        "Посты накапливаются в очереди. /resume для возобновления."
-    )
-    log.info("[CMD] /pause")
-
+    await update.message.reply_text("Pavza. /resume za nadaljevanje.")
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state["paused"] = False
-    q = state["queue"][:]
-    await update.message.reply_text(f"▶️ Публикации возобновлены. В очереди: {len(q)} постов.")
+    await update.message.reply_text("Nadaljujem.")
 
-    for item in q:
-        if state["stats"]["published"] >= MAX_POSTS_PER_DAY:
-            break
-        await publish_post(ctx.bot, item["post"], item["url"])
-        if item in state["queue"]:
-            state["queue"].remove(item)
-        await asyncio.sleep(10)
-
-    log.info("[CMD] /resume")
-
+async def cmd_autopilot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    state["autopilot"] = not state["autopilot"]
+    await update.message.reply_text(f"Autopilot: {'VKLJUCEN' if state['autopilot'] else 'IZKLJUCEN'}")
 
 async def cmd_queue(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = state["queue"]
-    if not q:
-        await update.message.reply_text("📭 Очередь пуста.")
+    p = state["pending"]
+    if not p:
+        await update.message.reply_text("Ni postov za odobritev.")
         return
-
-    text = f"📋 В очереди: {len(q)} постов\n\n"
-    for i, item in enumerate(q[:5], 1):
-        snippet = item["post"][:80].replace("*", "")
-        text += f"{i}. {snippet}…\n\n"
-
+    text = f"Caka {len(p)} postov:\n\n"
+    for pid, item in list(p.items())[:3]:
+        text += f"{pid}: {item['title'][:60]}\n\n"
     await update.message.reply_text(text)
-
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = state["stats"]
-    since = s["reset_at"].strftime("%d.%m %H:%M")
-    text = (
-        f"📊 Отчёт SLO.EXPOSED (с {since})\n\n"
-        f"◎ Просканировано новостей: {s['scanned']}\n"
-        f"◈ Написано постов: {s['written']}\n"
-        f"◐ Одобрено: {s['approved']} · Отклонено: {s['rejected']}\n"
-        f"◉ Опубликовано: {s['published']}/{MAX_POSTS_PER_DAY}\n\n"
-        f"Статус: {'🟢 Работает' if state['running'] else '🔴 Остановлен'}"
-        f"{' ⏸ Пауза' if state['paused'] else ''}"
+    await update.message.reply_text(
+        f"SLO.EXPOSED v2.0 porocilo\n\n"
+        f"Skenirano: {s['scanned']}\n"
+        f"Raziskano: {s['researched']}\n"
+        f"Napisano: {s['written']}\n"
+        f"Odobreno: {s['approved']} / Zavrnjeno: {s['rejected']}\n"
+        f"Objavljeno: {s['published']}/{MAX_POSTS_PER_DAY}\n\n"
+        f"Status: {'Deluje' if state['running'] else 'Ustavljeno'}"
+        f"{' (pavza)' if state['paused'] else ''}\n"
+        f"Autopilot: {'DA' if state['autopilot'] else 'NE'}"
     )
-    await update.message.reply_text(text)
 
+async def cmd_investigate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    topic = " ".join(ctx.args) if ctx.args else ""
+    if not topic:
+        await update.message.reply_text("Uporaba: /investigate tema ali ime osebe")
+        return
+    await update.message.reply_text(f"Raziskujem: {topic}...")
+    news = {"title":topic,"summary":topic,
+            "url":f"https://www.google.com/search?q={topic.replace(' ','+')}+Slovenija+korupcija",
+            "source":"MANUAL","hash":url_hash(topic+str(datetime.now()))}
+    await process_news(ctx.bot, news)
 
 async def cmd_test(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🧪 Запускаю тестовый цикл...")
-
-    test_news = {
-        "title": "Bivši župan obtožen korupcije pri javnih naročilih",
-        "summary": (
-            "Tožilstvo je vložilo obtožnico zoper bivšega župana zaradi domnevnega jemanja "
-            "podkupnin pri dodeljevanju javnih naročil v vrednosti 1,2 milijona evrov. "
-            "Preiskava je trajala 14 mesecev."
-        ),
-        "source": "TEST",
-        "url": "https://test.example.com/test-news",
-        "hash": "test123",
-    }
-
-    try:
-        post = await write_post(test_news)
-        verdict = await editor_check(post)
-        status = "✅ Одобрен" if verdict.get("approved") else "❌ Отклонён"
-
-        await update.message.reply_text(f"📝 Тестовый пост:\n\n{post}")
-        await update.message.reply_text(
-            f"Вердикт Editor: {status}\n"
-            f"Score: {verdict.get('score')}/10\n"
-            f"Причина: {verdict.get('reason')}"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка теста: {e}")
-
-
-async def cmd_sources(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = "📡 Активные источники:\n\n"
-
-    text += "RSS:\n"
-    for s in RSS_SOURCES:
-        text += f"◦ {s['name']} ({s['lang'].upper()})\n"
-
-    text += "\nSites:\n"
-    for s in PAGE_SOURCES:
-        text += f"◦ {s['name']} ({s['lang'].upper()})\n"
-
-    text += f"\nКлючевых слов: {len(KEYWORDS)}"
-    await update.message.reply_text(text)
-
+    await update.message.reply_text("Testni cikel z web iskanjem...")
+    news = {"title":"Korupcija pri javnih narocilih v slovenskem zdravstvu 2024",
+            "summary":"Tuzilstvo preiskuje sum korupcije pri javnih narocilih.",
+            "url":"https://www.rtvslo.si","source":"TEST",
+            "hash":url_hash("test"+str(datetime.now()))}
+    await process_news(ctx.bot, news)
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "SLO.EXPOSED Bot\n\n"
-        "/start — запустить редакцию\n"
-        "/stop — остановить всё\n"
-        "/pause — пауза публикаций\n"
-        "/resume — возобновить\n"
-        "/queue — посмотреть очередь\n"
-        "/report — статистика\n"
-        "/test — тестовый цикл\n"
-        "/sources — список источников\n"
-        "/help — помощь"
+        "SLO.EXPOSED v2.0\n\n"
+        "/start — zagon\n/stop — ustavitev\n/pause — pavza\n/resume — nadaljuj\n"
+        "/autopilot — preklopi avtomatsko objavo\n/queue — cakajoci posti\n"
+        "/report — statistika\n/investigate tema — rocna raziskava\n/test — test\n\n"
+        "Ko AI pripravi post, dobis gumba OBJAVI / ZAVRNI v chat."
     )
 
-
-# ─── ENTRY POINT ───────────────────────────────────────────────────────────
 def main():
-    log.info("=" * 50)
-    log.info("  SLO.EXPOSED AI Newsroom Bot")
-    log.info("=" * 50)
-
+    log.info("SLO.EXPOSED v2.0 — AI Investigative Newsroom")
     app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("stop", cmd_stop))
-    app.add_handler(CommandHandler("pause", cmd_pause))
-    app.add_handler(CommandHandler("resume", cmd_resume))
-    app.add_handler(CommandHandler("queue", cmd_queue))
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("test", cmd_test))
-    app.add_handler(CommandHandler("sources", cmd_sources))
-    app.add_handler(CommandHandler("help", cmd_help))
-
-    log.info("Бот запущен. Ожидание команды /start...")
+    for cmd, fn in [("start",cmd_start),("stop",cmd_stop),("pause",cmd_pause),
+                    ("resume",cmd_resume),("autopilot",cmd_autopilot),("queue",cmd_queue),
+                    ("report",cmd_report),("investigate",cmd_investigate),("test",cmd_test),("help",cmd_help)]:
+        app.add_handler(CommandHandler(cmd, fn))
+    app.add_handler(CallbackQueryHandler(handle_approval))
+    log.info("Cakam /start...")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()

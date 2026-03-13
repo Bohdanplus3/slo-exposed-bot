@@ -21,10 +21,17 @@ MAX_POSTS_PER_DAY = int(os.environ.get("MAX_POSTS_PER_DAY", "6"))
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
 
 RSS_SOURCES = [
-    {"name": "Necenzurirano", "url": "https://necenzurirano.si/feed/",     "lang": "sl"},
-    {"name": "Pozareport",    "url": "https://www.pozareport.si/feed/",    "lang": "sl"},
-    {"name": "OCCRP",         "url": "https://occrp.org/en/rss",           "lang": "en"},
-    {"name": "RTV Slovenija", "url": "https://www.rtvslo.si/feeds/03.xml", "lang": "sl"},
+    # Primarni viri (investigativni)
+    {"name": "Necenzurirano", "url": "https://necenzurirano.si/feed/",          "lang": "sl"},
+    {"name": "Pozareport",    "url": "https://www.pozareport.si/feed/",         "lang": "sl"},
+    {"name": "OCCRP",         "url": "https://occrp.org/en/rss",               "lang": "en"},
+    # RTV Slovenija - vec kanalov za pokritost
+    {"name": "RTV Slovenija", "url": "https://www.rtvslo.si/feeds/00.xml",      "lang": "sl"},
+    {"name": "RTV Slovenija", "url": "https://www.rtvslo.si/feeds/03.xml",      "lang": "sl"},
+    # Rezervni viri
+    {"name": "STA",           "url": "https://www.sta.si/en/rss.xml",           "lang": "en"},
+    {"name": "N1 Slovenija",  "url": "https://n1info.si/feed/",                 "lang": "sl"},
+    {"name": "Dnevnik",       "url": "https://www.dnevnik.si/rss",              "lang": "sl"},
 ]
 
 KEYWORDS = [

@@ -186,7 +186,8 @@ PRIMER:
 Janez Hribar, direktor državnega podjetja STO d.o.o., je med 2021 in 2023 
 nakazal 840.000 € na račune treh podjetij svojega brata. KPK primer 
 preučuje že leto dni. Hribar ostaja na funkciji.
-@slo_exposed"""
+@slo_exposed
+Piši SAMO v slovenščini"""
 
 async def write_post(news: dict, editor_feedback: str = "") -> str:
     """Writer agent. Принимает опциональный фидбек от Editor для переработки."""

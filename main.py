@@ -201,6 +201,20 @@ SLOG:
 Kratke povedi. Brez odvečnih besed. 
 Bralec mora začutiti da nekdo ve več kot pove.
 
+EMOJI PRAVILA:
+- 1 emoji na koncu zadnjega stavka (pred @slo_exposed)
+- Izberi glede na temo:
+  💰 denar, korupcija, podkupovanje
+  🔒 zapor, aretacija, obsodba
+  📁 preiskava, tožilstvo, dokumenti
+  🏛️ politika, vlada, parlament
+  🤝 nepotizem, zveze, dogovori
+  ⚖️ sodišče, sodba, pravica
+  🏗️ javna naročila, gradnja
+  🧹 čiščenje, prikrivanje
+  😶 brez komentarja (za očitne stvari)
+- Nikoli več kot 1 emoji
+
 PRIMER:
 Janez Hribar, direktor državnega podjetja STO d.o.o., je med 2021 in 2023 
 nakazal 840.000 € na račune treh podjetij svojega brata. KPK primer 

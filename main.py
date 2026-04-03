@@ -163,6 +163,25 @@ async def scan_sources() -> list[dict]:
     if found:
         save_seen_urls()  # сохраняем после каждого скана
     return found
+    
+async def fetch_og_image(url: str) -> str | None:
+    """Берёт og:image с оригинальной страницы новости."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url, follow_redirects=True, 
+                                  headers={"User-Agent": "Mozilla/5.0"})
+            # Ищем og:image в HTML
+            import re
+            match = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', r.text)
+            if match:
+                return match.group(1)
+            # Альтернативный порядок атрибутов
+            match = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', r.text)
+            if match:
+                return match.group(1)
+    except Exception as e:
+        log.warning(f"[IMAGE] Не удалось получить фото: {e}")
+    return None
 
 # ─── AGENT 2: WRITER ───────────────────────────────────────────────────────
 LANG_MAP = {"sl": "slovenščina", "en": "english", "ru": "русский", "de": "deutsch"}
@@ -247,35 +266,47 @@ async def editor_check(post: str) -> dict:
 async def publish_post(bot: Bot, post: str, source_url: str) -> bool:
     if state["paused"]:
         state["queue"].append({
-            "post": post,
-            "url": source_url,
+            "post": post, 
+            "url": source_url, 
             "queued_at": datetime.now().isoformat()
         })
-        log.info("[PUBLISHER] Пауза — пост добавлен в очередь")
         return False
 
     if state["stats"]["published"] >= MAX_POSTS_PER_DAY:
-        log.info(f"[PUBLISHER] Лимит {MAX_POSTS_PER_DAY} постов/день достигнут")
         return False
 
     try:
-        await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=post,
-            parse_mode=None,
-            disable_web_page_preview=False,
-        )
+        # Пробуем получить фото
+        image_url = await fetch_og_image(source_url)
+
+        if image_url:
+            await bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=image_url,
+                caption=post,
+                parse_mode=None,
+            )
+        else:
+            # Без фото — просто текст
+            await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=post,
+                parse_mode=None,
+            )
+
         state["stats"]["published"] += 1
-        log.info(f"[PUBLISHER] ✅ Опубликовано (#{state['stats']['published']} сегодня)")
+        log.info(f"[PUBLISHER] ✅ Опубликовано {'с фото' if image_url else 'без фото'}")
 
         if ADMIN_CHAT_ID:
             await bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=f"✅ Пост #{state['stats']['published']}/{MAX_POSTS_PER_DAY}\n🔗 {source_url}",
+                text=f"✅ Пост #{state['stats']['published']}/{MAX_POSTS_PER_DAY}\n"
+                     f"{'🖼 С фото' if image_url else '📝 Без фото'}\n"
+                     f"🔗 {source_url}",
             )
         return True
     except Exception as e:
-        log.error(f"[PUBLISHER] Ошибка публикации: {e}")
+        log.error(f"[PUBLISHER] Ошибка: {e}")
         return False
 
 # ─── MAIN PIPELINE ─────────────────────────────────────────────────────────
